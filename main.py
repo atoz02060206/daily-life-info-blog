@@ -104,7 +104,7 @@ def tavily_search(query: str, max_results: int = 6) -> list[dict]:
     data = api_post('https://api.tavily.com/search',
                     headers={'Authorization': f"Bearer {need('TAVILY_API_KEY')}", 'Content-Type': 'application/json'},
                     payload={'query': query, 'search_depth': 'basic', 'topic': 'general', 'max_results': max_results,
-                             'include_answer': False, 'include_raw_content': True, 'country': 'south korea'},
+                             'include_answer': False, 'include_raw_content': False, 'country': 'south korea'},
                     label='Tavily', attempts=2)
     results = []
     for item in data.get('results', []):
@@ -112,7 +112,7 @@ def tavily_search(query: str, max_results: int = 6) -> list[dict]:
         if url.startswith('https://'):
             results.append({'title': item.get('title') or urlparse(url).netloc, 'url': url,
                             'domain': urlparse(url).netloc.lower(),
-                            'content': (item.get('raw_content') or item.get('content') or '')[:9000]})
+                            'content': (item.get('content') or item.get('raw_content') or '')[:1600]})
     return results
 
 def weighted_category() -> str:
@@ -129,7 +129,7 @@ def research_topic(category: str) -> dict:
     seeds = CATEGORIES[category]['seeds']
     day = datetime.now(KST).timetuple().tm_yday
     seed = seeds[(day - 1) % len(seeds)]
-    results = tavily_search(f'대한민국 {seed} 최신 정보 공식 정부 공공기관 소비자원 {TODAY}', 6)
+    results = tavily_search(f'대한민국 {seed} 최신 정보 공식 정부 공공기관 소비자원 {TODAY}', 4)
     if len(results) < 2:
         raise RuntimeError('주제 탐색 출처가 2개 미만입니다. 안전을 위해 발행을 중단합니다.')
     prompt = f'''오늘 날짜는 {TODAY}, 카테고리는 {category}, 검색 후보는 {seed}다.
@@ -145,7 +145,7 @@ JSON만 출력: {{"topic":"구체적인 글 주제","search_intent":"독자가 �
 def research_facts(topic: dict) -> dict:
     # Search the selected topic and pass source results to the writer.
     query = f"대한민국 {topic.get('topic')} {topic.get('search_intent')} 공식 안내 기준 조건 예외 {TODAY}"
-    results = tavily_search(query, 7)
+    results = tavily_search(query, 5)
     all_sources = list(topic.get('_sources', [])); seen = {x.get('url') for x in all_sources}
     for item in results:
         if item['url'] not in seen: all_sources.append(item); seen.add(item['url'])
@@ -162,15 +162,30 @@ JSON만 출력: {{"research_summary":"조사 요약","facts":[{{"claim":"확인�
 
 def write_article(topic: dict, research: dict) -> dict:
     sources = research.get('_sources', [])
-    source_lines = '\n'.join(f"- {s['title']} | {s['url']}" for s in sources)
+    # Never send the full Tavily payload to the writer: keep only concise verified facts
+    # and source metadata so the prompt stays comfortably below Groq's free-tier TPM cap.
+    compact_research = {
+        'research_summary': str(research.get('research_summary', ''))[:1800],
+        'facts': [
+            {'claim': str(x.get('claim', ''))[:300], 'detail': str(x.get('detail', ''))[:500],
+             'source_hint': str(x.get('source_hint', ''))[:120]}
+            for x in research.get('facts', [])[:6] if isinstance(x, dict)
+        ],
+        'cautions': [str(x)[:250] for x in research.get('cautions', [])[:5]],
+        'how_to_check': str(research.get('how_to_check', ''))[:500],
+    }
+    compact_topic = {
+        'topic': str(topic.get('topic', ''))[:200],
+        'search_intent': str(topic.get('search_intent', ''))[:300],
+        'reader_benefit': str(topic.get('reader_benefit', ''))[:300],
+        'outline': [str(x)[:100] for x in topic.get('outline', [])[:5]],
+    }
+    source_lines = '\n'.join(f"- {s['title'][:180]} | {s['url']}" for s in sources[:8])
     prompt = f'''너는 한국의 실용적인 생활정보 전문 에디터다. 아래 조사 결과와 출처만 근거로 블로그 글을 작성한다.
 오늘 날짜: {TODAY}
 카테고리: {weighted_category()}
-주제: {topic.get('topic')}
-검색 의도: {topic.get('search_intent')}
-독자 혜택: {topic.get('reader_benefit')}
-구성 제안: {json.dumps(topic.get('outline', []), ensure_ascii=False)}
-조사 결과: {json.dumps(research, ensure_ascii=False)}
+주제 및 독자 의도: {json.dumps(compact_topic, ensure_ascii=False)}
+검증된 조사 결과: {json.dumps(compact_research, ensure_ascii=False)}
 확보된 출처 목록:
 {source_lines}
 
