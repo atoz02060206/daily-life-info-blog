@@ -64,7 +64,8 @@ def api_post(url: str, *, headers: dict, payload: dict, label: str, attempts: in
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
             if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
-                wait = [5, 15][min(attempt, 1)]
+                # Groq free-tier TPM limits are minute-based; a short retry repeats the same failure.
+                wait = 65 if response.status_code == 429 else [5, 15][min(attempt, 1)]
                 print(f'[{label} 재시도] HTTP {response.status_code}, {wait}초 대기')
                 time.sleep(wait); continue
             if not response.ok:
@@ -203,7 +204,7 @@ JSON 객체만 출력:
 8. 출처를 본문에서 언급할 때는 확보된 출처에 한정할 것. HTML 태그/마크다운 금지.
 9. last_checked는 실제 조사일인 {TODAY}로 작성.
 '''
-    article = extract_json(groq_text(prompt, temperature=0.55, max_tokens=5000))
+    article = extract_json(groq_text(prompt, temperature=0.55, max_tokens=1800))
     article['_sources'] = sources
     article['_research'] = research
     article['_topic'] = topic
