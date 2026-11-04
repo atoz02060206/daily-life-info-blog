@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
   schedule:
-    - cron: '30 0 * * 1,3,5' # KST 월/수/금 09:30
+    - cron: '30 0 * * 1,3,5' # 월·수·금 KST 09:30
 permissions:
   contents: read
 concurrency:
@@ -23,7 +23,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
       BLOG_URL: ${{ secrets.BLOG_URL }}
       BLOG_NAME: ${{ vars.BLOG_NAME }}
@@ -46,11 +46,11 @@ jobs:
             echo "DRY_RUN=${{ inputs.dry_run }}" >> "$GITHUB_ENV"
           else
             echo 'TASK=auto' >> "$GITHUB_ENV"
-            echo 'DRY_RUN=true' >> "$GITHUB_ENV"
+            echo 'DRY_RUN=false' >> "$GITHUB_ENV"
           fi
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Research, write, quality-check and preview/publish
+      - name: Research, write, quality-check and publish
         run: python main.py
       - name: Upload previews
         if: always()
