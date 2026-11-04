@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """생활정보 Blogger 자동화 v1.0
-- Gemini Google Search grounding으로 주제 조사
+- Tavily 검색과 Groq 글 생성을 이용한 주제 조사
 - 조사 근거를 바탕으로 한국어 글 생성
 - 출처/구조/중복/품질 검수 후 미리보기 또는 Blogger 발행
 - 기본값은 DRY_RUN=true (미리보기 전용)
@@ -23,8 +23,6 @@ KST = timezone(timedelta(hours=9))
 TODAY = datetime.now(KST).strftime('%Y-%m-%d')
 BLOG_URL = os.getenv('BLOG_URL', '').strip().rstrip('/') + '/'
 BLOG_NAME = os.getenv('BLOG_NAME', '생활정보 노트').strip()
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '').strip()
-GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-3.8-flash').strip()
 DRY_RUN = os.getenv('DRY_RUN', 'true').lower() not in ('0', 'false', 'no')
 TASK = os.getenv('TASK', 'auto').strip().lower()
 OUT_DIR = Path('.')
@@ -60,52 +58,62 @@ def need(name: str) -> str:
     return value
 
 
-def post_json_retry(url: str, *, headers: dict, payload: dict, attempts: int = 4) -> dict:
+def api_post(url: str, *, headers: dict, payload: dict, label: str, attempts: int = 3) -> dict:
     last_error = None
     for attempt in range(attempts):
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-            if response.status_code in TRANSIENT and attempt < attempts - 1:
-                wait = [5, 15, 30][min(attempt, 2)]
-                print(f'[일시 오류 재시도] HTTP {response.status_code}, {wait}초 대기')
-                time.sleep(wait)
-                continue
+            if response.status_code in (408, 429, 500, 502, 503, 504) and attempt < attempts - 1:
+                wait = [5, 15][min(attempt, 1)]
+                print(f'[{label} 재시도] HTTP {response.status_code}, {wait}초 대기')
+                time.sleep(wait); continue
             if not response.ok:
-                raise RuntimeError(f'Gemini API 오류 {response.status_code}: {response.text[:700]}')
+                raise RuntimeError(f'{label} API 오류 {response.status_code}: {response.text[:700]}')
             return response.json()
         except requests.RequestException as exc:
             last_error = exc
             if attempt < attempts - 1:
-                wait = [5, 15, 30][min(attempt, 2)]
-                print(f'[네트워크 재시도] {exc}, {wait}초 대기')
-                time.sleep(wait)
-    raise RuntimeError(f'Gemini 요청이 {attempts}회 실패했습니다: {last_error}')
+                wait = [5, 15][min(attempt, 1)]
+                print(f'[{label} 네트워크 재시도] {exc}, {wait}초 대기'); time.sleep(wait)
+    raise RuntimeError(f'{label} 요청 실패: {last_error}')
 
 
-def gemini_url() -> str:
-    return f'https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent'
-
-
-def extract_text(data: dict) -> str:
-    try:
-        parts = data['candidates'][0]['content']['parts']
-        return '\n'.join(str(p.get('text', '')) for p in parts if p.get('text'))
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError('Gemini 응답에서 본문 텍스트를 찾지 못했습니다.')
+def groq_text(prompt: str, *, temperature: float = 0.35, max_tokens: int = 3000) -> str:
+    payload = {'model': os.getenv('GROQ_MODEL', 'openai/gpt-oss-120b').strip(),
+               'messages': [{'role': 'system', 'content': '한국어 생활정보 전문 에디터다. 제공된 자료에 없는 사실을 만들지 말고 요청된 JSON만 출력한다.'},
+                            {'role': 'user', 'content': prompt}],
+               'temperature': temperature, 'max_completion_tokens': max_tokens,
+               'response_format': {'type': 'json_object'}}
+    data = api_post('https://api.groq.com/openai/v1/chat/completions',
+                    headers={'Authorization': f"Bearer {need('GROQ_API_KEY')}", 'Content-Type': 'application/json'},
+                    payload=payload, label='Groq')
+    try: return data['choices'][0]['message']['content']
+    except (KeyError, IndexError, TypeError): raise RuntimeError('Groq 응답에서 본문을 찾지 못했습니다.')
 
 
 def extract_json(text: str) -> dict:
-    cleaned = text.strip()
-    cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.I)
+    cleaned = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.I)
     cleaned = re.sub(r'\s*```$', '', cleaned)
     start, end = cleaned.find('{'), cleaned.rfind('}')
-    if start < 0 or end <= start:
-        raise RuntimeError('Gemini 응답에서 JSON 객체를 찾지 못했습니다.')
-    try:
-        return json.loads(cleaned[start:end + 1])
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f'Gemini JSON 해석 실패: {exc}')
+    if start < 0 or end <= start: raise RuntimeError('AI 응답에서 JSON 객체를 찾지 못했습니다.')
+    try: return json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError as exc: raise RuntimeError(f'AI JSON 해석 실패: {exc}')
 
+
+def tavily_search(query: str, max_results: int = 6) -> list[dict]:
+    data = api_post('https://api.tavily.com/search',
+                    headers={'Authorization': f"Bearer {need('TAVILY_API_KEY')}", 'Content-Type': 'application/json'},
+                    payload={'query': query, 'search_depth': 'basic', 'topic': 'general', 'max_results': max_results,
+                             'include_answer': False, 'include_raw_content': True, 'country': 'south korea'},
+                    label='Tavily', attempts=2)
+    results = []
+    for item in data.get('results', []):
+        url = str(item.get('url', '')).strip()
+        if url.startswith('https://'):
+            results.append({'title': item.get('title') or urlparse(url).netloc, 'url': url,
+                            'domain': urlparse(url).netloc.lower(),
+                            'content': (item.get('raw_content') or item.get('content') or '')[:9000]})
+    return results
 
 def weighted_category() -> str:
     # 날짜 기반 회전으로 같은 날 재실행해도 카테고리가 흔들리지 않게 함
@@ -117,74 +125,47 @@ def weighted_category() -> str:
 
 
 def research_topic(category: str) -> dict:
-    """Google Search grounding으로 실제 검색 결과에 근거한 주제/자료 조사."""
+    # Tavily search results guide topic selection.
     seeds = CATEGORIES[category]['seeds']
-    prompt = f'''너는 한국 생활정보 전문 리서처다. 오늘은 {TODAY}이고 조사 분야는 "{category}"다.
-아래 후보 영역을 참고해 한국 독자가 실제로 검색하고 당장 활용할 만한 구체적인 생활정보 글감 하나를 선정하라.
-후보: {', '.join(seeds)}
-
-검색을 통해 현재도 유효한지 확인하고, 가능하면 정부·공공기관·공식 사업자·소비자기관의 원문 자료를 우선 확인하라.
-아래 JSON만 출력하라.
-{{"topic":"구체적인 글 주제","search_intent":"독자가 해결하려는 질문","reader_benefit":"글을 읽고 얻는 실질적 도움","timeliness":"지금 다룰 이유 또는 상시형 주제인 이유","outline":["소제목1","소제목2","소제목3","소제목4"],"research_questions":["확인할 사실1","확인할 사실2","확인할 사실3"]}}
-사실이나 제도 변경 여부를 확인하지 못하면 추정하지 말고 다른 주제를 고르라. 특정 상품 가입·구매를 유도하지 말라.'''
-    payload = {
-        'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-        'tools': [{'google_search': {}}],
-        'generationConfig': {'temperature': 0.45, 'maxOutputTokens': 1800},
-    }
-    data = post_json_retry(gemini_url(), headers={'x-goog-api-key': need('GEMINI_API_KEY'), 'Content-Type': 'application/json'}, payload=payload)
-    topic = extract_json(extract_text(data))
-    grounding = data.get('candidates', [{}])[0].get('groundingMetadata', {})
-    chunks = grounding.get('groundingChunks', []) or []
-    sources = []
-    for chunk in chunks:
-        web = chunk.get('web') or {}
-        uri, title = web.get('uri'), web.get('title')
-        if uri and uri.startswith('http'):
-            host = urlparse(uri).netloc.lower()
-            if not any(s['url'] == uri for s in sources):
-                sources.append({'title': title or host, 'url': uri, 'domain': host})
-    topic['_sources'] = sources
-    topic['_search_queries'] = grounding.get('webSearchQueries', [])
+    day = datetime.now(KST).timetuple().tm_yday
+    seed = seeds[(day - 1) % len(seeds)]
+    results = tavily_search(f'대한민국 {seed} 최신 정보 공식 정부 공공기관 소비자원 {TODAY}', 6)
+    if len(results) < 2:
+        raise RuntimeError('주제 탐색 출처가 2개 미만입니다. 안전을 위해 발행을 중단합니다.')
+    prompt = f'''오늘 날짜는 {TODAY}, 카테고리는 {category}, 검색 후보는 {seed}다.
+아래 실제 검색 결과를 읽고 출처가 뒷받침하는 범위 안에서 구체적인 생활정보 주제 하나를 정하라.
+검색결과: {json.dumps(results, ensure_ascii=False)}
+JSON만 출력: {{"topic":"구체적인 글 주제","search_intent":"독자가 해결하려는 질문","reader_benefit":"실질적 도움","timeliness":"지금 다룰 이유","outline":["소제목1","소제목2","소제목3","소제목4"],"research_questions":["확인할 사실1","확인할 사실2","확인할 사실3"]}}
+검색 결과와 무관한 정책·혜택을 만들지 말라.'''
+    topic = extract_json(groq_text(prompt, temperature=0.3, max_tokens=1800))
+    topic['_sources'] = results; topic['_search_queries'] = [seed]
     return topic
 
 
 def research_facts(topic: dict) -> dict:
-    """주제 선정과 별도 검색 단계에서 핵심 사실과 출처를 교차 확인."""
-    prompt = f'''다음 글감을 한국 생활정보 독자를 위해 추가 조사하라.
+    # Search the selected topic and pass source results to the writer.
+    query = f"대한민국 {topic.get('topic')} {topic.get('search_intent')} 공식 안내 기준 조건 예외 {TODAY}"
+    results = tavily_search(query, 7)
+    all_sources = list(topic.get('_sources', [])); seen = {x.get('url') for x in all_sources}
+    for item in results:
+        if item['url'] not in seen: all_sources.append(item); seen.add(item['url'])
+    if len(all_sources) < 2: raise RuntimeError('조사 근거 출처가 부족해 발행을 중단합니다.')
+    prompt = f'''다음 주제의 사실을 검색자료에 근거해 정리하라.
 주제: {topic.get('topic')}
-독자 질문: {topic.get('search_intent')}
 확인 질문: {json.dumps(topic.get('research_questions', []), ensure_ascii=False)}
-
-Google 검색을 사용해 최신 원문을 확인하라. 특히 적용 대상, 조건, 금액/기간/기준일, 예외, 신청·확인 방법을 구분하라.
-JSON만 출력:
-{{"research_summary":"조사 요약","facts":[{{"claim":"확인된 사실","detail":"조건과 맥락","source_hint":"해당 사실을 뒷받침하는 기관/문서"}}],"cautions":["독자가 오해하기 쉬운 점"],"how_to_check":"독자가 최신 정보를 직접 확인할 방법"}}
-출처가 확인되지 않은 숫자·날짜·제도 내용을 쓰지 말라. 자료끼리 다르면 그 차이를 명시하고 단정하지 말라.'''
-    payload = {
-        'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-        'tools': [{'google_search': {}}],
-        'generationConfig': {'temperature': 0.25, 'maxOutputTokens': 3000},
-    }
-    data = post_json_retry(gemini_url(), headers={'x-goog-api-key': need('GEMINI_API_KEY'), 'Content-Type': 'application/json'}, payload=payload)
-    facts = extract_json(extract_text(data))
-    grounding = data.get('candidates', [{}])[0].get('groundingMetadata', {})
-    all_sources = list(topic.get('_sources', []))
-    for chunk in grounding.get('groundingChunks', []) or []:
-        web = chunk.get('web') or {}
-        uri, title = web.get('uri'), web.get('title')
-        if uri and uri.startswith('http') and not any(s['url'] == uri for s in all_sources):
-            all_sources.append({'title': title or urlparse(uri).netloc, 'url': uri, 'domain': urlparse(uri).netloc.lower()})
-    facts['_sources'] = all_sources
-    facts['_search_queries'] = list(topic.get('_search_queries', [])) + list(grounding.get('webSearchQueries', []) or [])
+검색자료: {json.dumps(results, ensure_ascii=False)}
+JSON만 출력: {{"research_summary":"조사 요약","facts":[{{"claim":"확인된 사실","detail":"조건과 맥락","source_hint":"근거가 된 검색자료 제목"}}],"cautions":["오해하기 쉬운 점"],"how_to_check":"최신 정보를 확인할 방법"}}
+검색자료에 없는 금액·날짜·제도·조건은 추정하지 말라. 근거가 약한 사실은 facts에 넣지 말라.'''
+    facts = extract_json(groq_text(prompt, temperature=0.2, max_tokens=2600))
+    facts['_sources'] = all_sources; facts['_search_queries'] = [query]
     return facts
-
 
 def write_article(topic: dict, research: dict) -> dict:
     sources = research.get('_sources', [])
     source_lines = '\n'.join(f"- {s['title']} | {s['url']}" for s in sources)
     prompt = f'''너는 한국의 실용적인 생활정보 전문 에디터다. 아래 조사 결과와 출처만 근거로 블로그 글을 작성한다.
 오늘 날짜: {TODAY}
-카테고리: {topic.get('_category', weighted_category())}
+카테고리: {weighted_category()}
 주제: {topic.get('topic')}
 검색 의도: {topic.get('search_intent')}
 독자 혜택: {topic.get('reader_benefit')}
@@ -207,12 +188,7 @@ JSON 객체만 출력:
 8. 출처를 본문에서 언급할 때는 확보된 출처에 한정할 것. HTML 태그/마크다운 금지.
 9. last_checked는 실제 조사일인 {TODAY}로 작성.
 '''
-    payload = {
-        'contents': [{'role': 'user', 'parts': [{'text': prompt}]}],
-        'generationConfig': {'temperature': 0.65, 'maxOutputTokens': 5000},
-    }
-    data = post_json_retry(gemini_url(), headers={'x-goog-api-key': need('GEMINI_API_KEY'), 'Content-Type': 'application/json'}, payload=payload)
-    article = extract_json(extract_text(data))
+    article = extract_json(groq_text(prompt, temperature=0.55, max_tokens=5000))
     article['_sources'] = sources
     article['_research'] = research
     article['_topic'] = topic
@@ -341,7 +317,6 @@ def main():
     if TASK in overrides: category = overrides[TASK]
     print(f'[주제 탐색] category={category}, date={TODAY}')
     topic = research_topic(category)
-    topic['_category'] = category
     if not topic.get('topic') or not topic.get('search_intent'):
         raise RuntimeError('주제 탐색 결과가 필수 항목을 충족하지 못했습니다.')
     print(f"[선정 주제] {topic['topic']}")
