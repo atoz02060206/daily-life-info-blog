@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+from datetime import date
 
 import requests
 
@@ -117,15 +118,31 @@ def tavily_search(query: str, max_results: int = 6) -> list[dict]:
     return results
 
 def weighted_category() -> str:
-    # 날짜 기반 회전으로 같은 날 재실행해도 카테고리가 흔들리지 않게 함
+    # 100일 가중 순환을 하루 단위로 분산해 특정 카테고리가 연속되는 현상을 방지
     day = datetime.now(KST).timetuple().tm_yday
-    sequence = []
-    for name, cfg in CATEGORIES.items():
-        sequence.extend([name] * cfg['weight'])
-    return sequence[(day - 1) % len(sequence)]
+    total = sum(cfg['weight'] for cfg in CATEGORIES.values())
+    scores = {name: 0 for name in CATEGORIES}
+    selected = None
+    for _ in range(day):
+        for name, cfg in CATEGORIES.items():
+            scores[name] += cfg['weight']
+        selected = max(scores, key=scores.get)
+        scores[selected] -= total
+    return selected
 
 
-def research_topic(category: str) -> dict:
+def recent_published_titles(limit: int = 60) -> list[str]:
+    """Fetch recent live post titles so scheduled topics avoid recent repeats."""
+    service = blogger_service()
+    blogs = service.blogs().listByUser(userId='self').execute().get('items', [])
+    blog = next((b for b in blogs if b.get('url', '').rstrip('/').lower() == BLOG_URL.rstrip('/').lower()), None)
+    if not blog:
+        raise RuntimeError(f'Blogger 계정에서 대상 블로그를 찾지 못했습니다: {BLOG_URL}')
+    result = service.posts().list(blogId=blog['id'], status=['LIVE'], fetchBodies=False, maxResults=limit).execute()
+    return [str(item.get('title', '')).strip()[:100] for item in result.get('items', []) if item.get('title')]
+
+
+def research_topic(category: str, recent_titles: list[str] | None = None) -> dict:
     # Tavily search results guide topic selection.
     seeds = CATEGORIES[category]['seeds']
     day = datetime.now(KST).timetuple().tm_yday
@@ -133,11 +150,13 @@ def research_topic(category: str) -> dict:
     results = tavily_search(f'대한민국 {seed} 최신 정보 공식 정부 공공기관 소비자원 {TODAY}', 4)
     if len(results) < 2:
         raise RuntimeError('주제 탐색 출처가 2개 미만입니다. 안전을 위해 발행을 중단합니다.')
+    recent_titles = recent_titles or []
     prompt = f'''오늘 날짜는 {TODAY}, 카테고리는 {category}, 검색 후보는 {seed}다.
 아래 실제 검색 결과를 읽고 출처가 뒷받침하는 범위 안에서 구체적인 생활정보 주제 하나를 정하라.
+최근 발행한 글 제목(같은 주제·유사한 질문은 피할 것): {json.dumps(recent_titles[:60], ensure_ascii=False)}
 검색결과: {json.dumps(results, ensure_ascii=False)}
 JSON만 출력: {{"topic":"구체적인 글 주제","search_intent":"독자가 해결하려는 질문","reader_benefit":"실질적 도움","timeliness":"지금 다룰 이유","outline":["소제목1","소제목2","소제목3","소제목4"],"research_questions":["확인할 사실1","확인할 사실2","확인할 사실3"]}}
-검색 결과와 무관한 정책·혜택을 만들지 말라.'''
+검색 결과와 무관한 정책·혜택을 만들지 말라. 최근 발행 글과 제목만 바꾼 사실상 같은 주제를 선택하지 말고, 독자의 질문과 해결 방법이 다른 주제를 선택하라.'''
     topic = extract_json(groq_text(prompt, temperature=0.3, max_tokens=1800))
     topic['_sources'] = results; topic['_search_queries'] = [seed]
     return topic
@@ -229,6 +248,10 @@ def quality_check(article: dict) -> list[str]:
     if len(sources) < 2: errors.append('검색 근거 출처가 2개 미만')
     domains = {urlparse(s.get('url', '')).netloc.lower() for s in sources if s.get('url')}
     if len(domains) < 2: errors.append('서로 다른 출처 도메인이 2개 미만')
+    trusted_suffixes = ('.go.kr', 'gov.kr', '.or.kr')
+    trusted_domains = ('energyv.or.kr', 'kca.go.kr', 'bok.or.kr', 'fss.or.kr', 'fsc.go.kr', 'kosis.kr', 'korea.kr')
+    if not any(any(urlparse(s.get('url', '')).netloc.lower().endswith(suffix) for suffix in trusted_suffixes) or any(domain in urlparse(s.get('url', '')).netloc.lower() for domain in trusted_domains) for s in sources):
+        errors.append('정부·공공기관 등 1차 출처를 확인하지 못함')
     if len(facts) < 2: errors.append('검증된 핵심 사실이 2개 미만')
     if not article.get('conclusion'): errors.append('결론 누락')
     if article.get('last_checked') != TODAY: errors.append('자료 확인일이 오늘 날짜와 다름')
@@ -244,31 +267,71 @@ def make_signature(article: dict) -> str:
     return hashlib.sha256(raw.encode('utf-8')).hexdigest()[:24]
 
 
+def split_paragraphs(text: str) -> str:
+    # Split dense Korean copy into short, mobile-friendly paragraphs.
+    text = str(text or '').strip()
+    if not text:
+        return ''
+    # Preserve intentional paragraph breaks; otherwise group two sentences.
+    chunks = [x.strip() for x in re.split(r'\n+', text) if x.strip()]
+    paragraphs = []
+    for chunk in chunks:
+        sentences = re.split(r'(?<=[.!?。])\s+', chunk)
+        group = []
+        for sentence in sentences:
+            if sentence:
+                group.append(sentence)
+            if len(group) >= 2:
+                paragraphs.append(' '.join(group)); group = []
+        if group:
+            paragraphs.append(' '.join(group))
+    return ''.join(f'<p style="margin:0 0 15px;line-height:1.9;color:#343a40">{html.escape(p)}</p>' for p in paragraphs)
+
+
 def render_html(article: dict) -> str:
     esc = html.escape
     sections_html = ''.join(
-        f'<h2>{esc(str(s.get("heading", "")))}</h2><p>{esc(str(s.get("body", "")))}</p>'
+        f'''<section style="margin:30px 0 34px">
+<h2 style="font-size:21px;line-height:1.5;color:#174b38;margin:0 0 14px;padding:0 0 9px;border-bottom:1px solid #dce9e1">{esc(str(s.get("heading", "")))}</h2>
+{split_paragraphs(str(s.get("body", "")))}</section>'''
         for s in article.get('sections', [])
     )
-    checklist_html = ''.join(f'<li>{esc(str(item))}</li>' for item in article.get('checklist', []))
+    checklist_html = ''.join(
+        f'<li style="margin:0 0 11px;padding-left:3px;line-height:1.75">{esc(str(item))}</li>'
+        for item in article.get('checklist', [])
+    )
     sources_html = ''.join(
-        f'<li><a href="{esc(s["url"], quote=True)}" target="_blank" rel="noopener">{esc(s.get("title") or s.get("domain") or s["url"])}</a></li>'
+        f'<li style="margin:0 0 10px;line-height:1.65"><a style="color:#216b4d;text-decoration:underline;text-underline-offset:3px" href="{esc(s["url"], quote=True)}" target="_blank" rel="noopener">{esc(s.get("title") or s.get("domain") or s["url"])}</a></li>'
         for s in article.get('_sources', [])
     )
     tags = ', '.join(str(t) for t in article.get('tags', [])[:8])
+    facts = (article.get('_research') or {}).get('facts', [])
+    facts_html = ''.join(
+        f'''<div style="background:#fff;border:1px solid #e2ebe5;border-radius:12px;padding:14px 16px;margin:0 0 10px">
+<strong style="display:block;color:#174b38;margin:0 0 5px">{esc(str(f.get('claim','')))}</strong>
+<p style="margin:0;color:#555;line-height:1.75">{esc(str(f.get('detail','')))}</p></div>'''
+        for f in facts[:4] if isinstance(f, dict) and (f.get('claim') or f.get('detail'))
+    )
+    facts_block = (f'<div style="margin:24px 0 30px"><h2 style="font-size:20px;color:#174b38;margin:0 0 13px">먼저 확인할 핵심 내용</h2>{facts_html}</div>' if facts_html else '')
     return f'''<!-- LIFE_INFO_SIGNATURE:{make_signature(article)} -->
-<div style="font-family:'Pretendard','Noto Sans KR','Malgun Gothic',Arial,sans-serif;max-width:850px;margin:0 auto;line-height:1.85;color:#25282c;font-size:16px;word-break:keep-all">
-<p style="font-size:12px;font-weight:800;letter-spacing:1.2px;color:#28745b;margin:0 0 8px">LIFE INFO · {esc(BLOG_NAME)}</p>
-<h1 style="font-size:27px;line-height:1.45;margin:0 0 14px">{esc(article['title'])}</h1>
-<p style="font-size:13px;color:#777;margin:0 0 22px">자료 확인일 · {esc(str(article.get('last_checked', TODAY)))}</p>
-<p style="font-size:17px;color:#4b5563;margin:18px 0 26px">{esc(article['intro'])}</p>
+<div style="font-family:'Pretendard','Noto Sans KR','Malgun Gothic',Arial,sans-serif;max-width:780px;margin:0 auto;padding:0 2px;line-height:1.85;color:#25282c;font-size:16px;word-break:keep-all">
+<div style="font-size:12px;font-weight:800;letter-spacing:1.3px;color:#28745b;margin:0 0 10px">LIFE INFO · {esc(BLOG_NAME)}</div>
+<h1 style="font-size:28px;line-height:1.42;letter-spacing:-.6px;margin:0 0 13px;color:#17251e">{esc(article['title'])}</h1>
+<p style="font-size:12px;color:#89918c;margin:0 0 22px">자료 확인일 · {esc(str(article.get('last_checked', TODAY)))}</p>
+<div style="background:#f1f7f3;border:1px solid #e0ece4;border-radius:14px;padding:19px 20px;margin:0 0 28px">
+<div style="font-size:12px;font-weight:800;letter-spacing:.5px;color:#28745b;margin:0 0 7px">이 글에서 알 수 있는 것</div>
+<p style="font-size:16px;line-height:1.85;color:#34483d;margin:0">{esc(article['intro'])}</p></div>
 <!--more-->
+{facts_block}
 {sections_html}
-<h2>실천 전 확인할 사항</h2><ul>{checklist_html}</ul>
-<div style="margin:28px 0;padding:18px 20px;background:#eff7f2;border-left:4px solid #28745b;border-radius:8px"><strong>핵심 정리</strong><p style="margin:7px 0 0">{esc(article['conclusion'])}</p></div>
-<h2>참고 자료 및 출처</h2><ul>{sources_html}</ul>
-<p style="font-size:12px;color:#777;border-top:1px solid #e5e7eb;padding-top:14px;margin-top:24px">이 글은 일반적인 정보 제공을 목적으로 합니다. 제도·요금·상품 조건은 변경될 수 있으므로 실제 이용 전 공식 출처에서 최신 내용을 확인하세요.</p>
-<p style="font-size:12px;color:#888">관련 주제: {esc(tags)}</p>
+<section style="background:#f8faf8;border:1px solid #e5ece7;border-radius:14px;padding:18px 20px;margin:30px 0">
+<h2 style="font-size:20px;color:#174b38;margin:0 0 14px">실천 전 확인할 사항</h2><ul style="padding-left:21px;margin:0">{checklist_html}</ul></section>
+<div style="margin:28px 0;padding:20px 21px;background:#eaf4ee;border-left:4px solid #28745b;border-radius:0 12px 12px 0">
+<div style="font-size:12px;font-weight:800;letter-spacing:.7px;color:#28745b;margin-bottom:7px">핵심 정리</div><p style="font-size:16px;line-height:1.85;color:#263b30;margin:0">{esc(article['conclusion'])}</p></div>
+<section style="margin-top:34px;padding-top:20px;border-top:1px solid #e5ebe7">
+<h2 style="font-size:18px;color:#174b38;margin:0 0 14px">참고 자료 및 출처</h2><ul style="padding-left:20px;margin:0">{sources_html}</ul></section>
+<p style="font-size:12px;line-height:1.7;color:#858d88;border-top:1px solid #edf0ee;padding-top:14px;margin-top:22px">이 글은 일반적인 정보 제공을 목적으로 합니다. 제도·요금·상품 조건은 변경될 수 있으므로 실제 이용 전 공식 출처에서 최신 내용을 확인하세요.</p>
+<p style="font-size:12px;color:#89918c;margin-top:10px">관련 주제: {esc(tags)}</p>
 </div>'''
 
 
@@ -332,7 +395,10 @@ def main():
     overrides = {'living': '생활비·절약', 'finance': '금융·돈 관리', 'travel': '여행·소비경제', 'economy': '물가·경제 흐름'}
     if TASK in overrides: category = overrides[TASK]
     print(f'[주제 탐색] category={category}, date={TODAY}')
-    topic = research_topic(category)
+    recent_titles = recent_published_titles() if not DRY_RUN else []
+    if not DRY_RUN:
+        print(f'[최근 발행 제목 확인] {len(recent_titles)}개 — 유사 주제 제외 적용')
+    topic = research_topic(category, recent_titles)
     if not topic.get('topic') or not topic.get('search_intent'):
         raise RuntimeError('주제 탐색 결과가 필수 항목을 충족하지 못했습니다.')
     print(f"[선정 주제] {topic['topic']}")
