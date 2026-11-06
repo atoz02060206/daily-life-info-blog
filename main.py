@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""아꼈슈 Blogger 자동화 v1.1
+"""아꼈슈 Blogger 자동화 v1.2
 - Tavily 검색과 Groq 글 생성을 이용한 주제 조사
 - 조사 근거를 바탕으로 한국어 글 생성
 - 출처/구조/중복/품질 검수 후 미리보기 또는 Blogger 발행
@@ -74,6 +74,8 @@ ARTICLE_MAX_TOKENS = 3200
 REPAIR_MAX_TOKENS = 1200
 TOPIC_SOURCE_CHARS = 450
 FACTS_SOURCE_CHARS = 1100
+FACTS_RETRY_SOURCE_CHARS = 650
+MIN_FACTS = 2
 
 CHECKLIST_MIN, CHECKLIST_MAX = 3, 5
 CONCLUSION_MIN_SENTENCES, CONCLUSION_MAX_SENTENCES = 2, 4
@@ -443,9 +445,29 @@ def research_facts(topic: dict) -> dict:
 JSON만 출력: {{"research_summary":"조사 요약","facts":[{{"claim":"확인된 사실","detail":"조건과 맥락","source_hint":"근거가 된 검색자료 제목"}}],"cautions":["오해하기 쉬운 점"],"how_to_check":"최신 정보를 확인할 방법"}}
 검색자료에 없는 금액·날짜·제도·조건은 추정하지 말라. 근거가 약한 사실은 facts에 넣지 말라.'''
     facts = groq_json(prompt, temperature=0.2, max_tokens=FACTS_MAX_TOKENS, reasoning_effort='medium')
+    log_response_keys('사실 조사', facts)
     facts['_sources'] = all_sources
     facts['_search_queries'] = [query]
     verify_research_facts(facts)
+    if len(facts['facts']) < MIN_FACTS:
+        # 기준은 낮추지 않고, 첫 검색 결과까지 넓혀 근거 있는 사실을 1회만 다시 찾는다.
+        print(f"[사실 재조사 1회] 확인된 사실 {len(facts['facts'])}개, 전체 검색자료로 다시 정리")
+        retry_prompt = f'''다음 주제와 관련해 검색자료에 명시된 사실만 추출하라.
+주제: {topic.get('topic')}
+검색자료: {json.dumps(compact_results(all_sources[:8], FACTS_RETRY_SOURCE_CHARS), ensure_ascii=False)}
+JSON만 출력: {{"research_summary":"조사 요약","facts":[{{"claim":"확인된 사실","detail":"조건과 맥락","source_hint":"근거가 된 검색자료 제목"}}],"cautions":["오해하기 쉬운 점"],"how_to_check":"최신 정보를 확인할 방법"}}
+자료에 명시된 사실을 {MIN_FACTS}개 이상 찾아 facts에 넣되, 자료에 없으면 추정하지 말고 찾은 만큼만 넣어라.'''
+        try:
+            retried = groq_json(retry_prompt, temperature=0.1, max_tokens=FACTS_MAX_TOKENS, reasoning_effort='medium', output_retries=0)
+        except RuntimeError as exc:
+            print(f'[사실 재조사 실패] {exc}')
+        else:
+            log_response_keys('사실 재조사', retried)
+            retried['_sources'] = all_sources
+            retried['_search_queries'] = [query]
+            verify_research_facts(retried)
+            if len(retried['facts']) > len(facts['facts']):
+                facts = retried
     return facts
 
 
@@ -453,8 +475,13 @@ def verify_research_facts(research: dict) -> None:
     """형식이 잘못됐거나 검색자료에 없는 금액·비율·날짜를 담은 사실은 제외한다."""
     corpus = source_corpus(research.get('_sources', []))
     kept = []
-    for fact in as_list(research.get('facts')):
-        if not isinstance(fact, dict) or not str(fact.get('claim') or '').strip():
+    for fact in as_list(first_value(research, 'facts', 'key_facts', 'verified_facts', '사실')):
+        if isinstance(fact, str):
+            fact = {'claim': fact, 'detail': ''}
+        if not isinstance(fact, dict):
+            continue
+        fact = dict(fact, claim=clean_text(first_value(fact, 'claim', 'fact', 'statement', '사실')), detail=clean_text(fact.get('detail')))
+        if not fact['claim']:
             continue
         unsupported = find_unsupported_figures(f"{fact.get('claim', '')} {fact.get('detail', '')}", corpus)
         if unsupported:
@@ -462,6 +489,15 @@ def verify_research_facts(research: dict) -> None:
             continue
         kept.append(fact)
     research['facts'] = kept
+
+
+def log_response_keys(label: str, data: dict) -> None:
+    """본문 없이 응답 구조만 기록해 필드 누락 원인을 로그로 확인할 수 있게 한다."""
+    summary = {}
+    for key, value in data.items():
+        if not str(key).startswith('_'):
+            summary[str(key)[:30]] = len(value) if isinstance(value, (list, str, dict)) else type(value).__name__
+    print(f'[{label} 응답 구조] {json.dumps(summary, ensure_ascii=False)}')
 
 
 def clean_text(value) -> str:
@@ -604,7 +640,9 @@ JSON 객체만 출력. 아래 키를 하나도 빠뜨리지 말 것:
 8. 제목 낚시, 공포 조장, 과장, 반복 문장, AI식 상투어 금지.
 9. 출처를 본문에서 언급할 때는 확보된 출처에 한정할 것. HTML 태그/마크다운 금지.
 '''
-    article = normalize_article(groq_json(prompt, temperature=0.55, max_tokens=ARTICLE_MAX_TOKENS))
+    raw_article = groq_json(prompt, temperature=0.55, max_tokens=ARTICLE_MAX_TOKENS)
+    log_response_keys('글 생성', raw_article)
+    article = normalize_article(raw_article)
     article['_sources'] = sources
     article['_research'] = research
     article['_topic'] = topic
@@ -778,7 +816,7 @@ def evidence_errors(sources: list, facts: list) -> list[str]:
         errors.append('서로 다른 출처 도메인이 2개 미만')
     if not any(is_trusted_host(host) for host in hosts):
         errors.append('정부·공공기관 등 1차 출처를 확인하지 못함')
-    if len(as_list(facts)) < 2:
+    if len(as_list(facts)) < MIN_FACTS:
         errors.append('검증된 핵심 사실이 2개 미만')
     if any(not str(s.get('url', '')).startswith('https://') for s in sources):
         errors.append('HTTPS가 아닌 출처 포함')
